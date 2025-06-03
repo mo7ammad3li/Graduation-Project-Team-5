@@ -1,0 +1,313 @@
+/* =====================
+   Global Defaults (Dark Theme)
+   ===================== */
+QWidget, QMainWindow {
+    background: #1e1e1e;
+    color: #e0e0e0;
+    font-family: "Segoe UI", "Arial", sans-serif;
+    font-size: 10pt;
+}
+
+/* =====================
+   QTabWidget (Login/Register Tabs, Dark Theme, Active Tab Reversed)
+   ===================== */
+QTabWidget::pane {
+    border: none;
+    background: #2a2a2a;
+}
+QTabBar::tab {
+    background: #2a2a2a;
+    color: #a0a0a0;
+    padding: 8px 16px;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background: #ff6600;
+    color: #1e1e1e;
+}
+QTabBar::tab:!selected {
+    margin-top: 2px; /* push unselected tabs down slightly */
+}
+
+/* =====================
+   QDialog (Dark Background)
+   ===================== */
+QDialog {
+    background: #2a2a2a;
+    border-radius: 8px;
+}
+
+/* =====================
+   QPushButton (All Buttons, Dark Theme)
+   ===================== */
+QPushButton {
+    background-color: #ff6600;
+    color: #1e1e1e;
+    border: none;
+    border-radius: 5px;
+    padding: 8px 12px;
+    min-height: 28px;
+}
+QPushButton:hover {
+    background-color: #e65500;
+}
+QPushButton:pressed {
+    background-color: #cc5500;
+}
+QPushButton:disabled {
+    background-color: #3a3a3a;
+    color: #707070;
+}
+
+/* =====================
+   QLineEdit (Dark Inputs)
+   ===================== */
+QLineEdit {
+    background-color: #303030;
+    border: 1px solid #505050;
+    border-radius: 5px;
+    padding: 6px 8px;
+    color: #e0e0e0;
+    selection-background-color: #555555;
+    selection-color: #ffffff;
+}
+QLineEdit:focus {
+    border: 1px solid #ff6600;
+}
+
+/* =====================
+   QTextEdit (Chat & Payment Address Box)
+   ===================== */
+QTextEdit {
+    background-color: #303030;
+    border: 1px solid #505050;
+    border-radius: 5px;
+    padding: 8px;
+    color: #e0e0e0;
+    selection-background-color: #555555;
+    selection-color: #ffffff;
+}
+QTextEdit:focus {
+    border: 1px solid #ff6600;
+}
+
+/* =====================
+   QListWidget (Conversation List / Contacts, Dark Theme)
+   ===================== */
+QListWidget {
+    background-color: #2a2a2a;
+    border: none;
+    outline: none;
+    padding: 4px;
+}
+QListWidget::item {
+    background-color: transparent;
+    color: #e0e0e0;
+    padding: 8px;
+    margin: 4px 0;
+    border-radius: 4px;
+}
+QListWidget::item:selected {
+    background-color: #ff6600;
+    color: #1e1e1e;
+}
+QListWidget::item:hover {
+    background-color: #3a3a3a;
+    color: #ffffff;
+}
+
+/* =====================
+   QLabel (Headers, Info Text)
+   ===================== */
+QLabel {
+    color: #e0e0e0;
+}
+QLabel#infoLabel {
+    font-size: 11pt;
+}
+
+/* =====================
+   Scrollbar Styling (Vertical) for QTextEdit, QListWidget, etc.
+   ===================== */
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 0px;
+}
+QScrollBar::handle:vertical {
+    background: #505050;
+    min-height: 20px;
+    border-radius: 4px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #707070;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    height: 0px;
+}
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
+}
+
+/* =====================
+   Chat Header (Top Bar in ChatWindow, Dark Theme)
+   ===================== */
+#chatHeader {
+    background-color: #2a2a2a;
+    border-bottom: 1px solid #505050;
+    padding: 10px;
+}
+#chatHeader QLabel {
+    font-size: 12pt;
+    font-weight: bold;
+    color: #e0e0e0;
+}
+
+/* =====================
+   Chat Message Bubbles (Dark)
+   ===================== */
+/* Sent bubble (accent orange) */
+.messageSent {
+    background: #ff6600;
+    color: #1e1e1e;
+    border-radius: 12px;
+    padding: 8px 12px;
+    margin: 4px 8px 4px auto;
+    max-width: 60%;
+}
+/* Received bubble (dark grey) */
+.messageReceived {
+    background: #3a3a3a;
+    color: #e0e0e0;
+    border-radius: 12px;
+    padding: 8px 12px;
+    margin: 4px auto 4px 8px;
+    max-width: 60%;
+}
+/* Timestamp label under each bubble */
+QLabel.timestamp {
+    font-size: 8pt;
+    color: #999999;
+    margin-top: 2px;
+}
+
+/* =====================
+   Input Area at Bottom of ChatWindow (Dark)
+   ===================== */
+#inputFrame {
+    background-color: #2a2a2a;
+    border-top: 1px solid #505050;
+    padding: 8px;
+}
+#messageInput {
+    background-color: #303030;
+    border: 1px solid #505050;
+    border-radius: 15px;
+    padding: 8px 12px;
+    min-height: 32px;
+    color: #e0e0e0;
+    selection-background-color: #555555;
+    selection-color: #ffffff;
+}
+#messageInput:focus {
+    border: 1px solid #ff6600;
+}
+#sendButton {
+    background-color: #ff6600;
+    color: #1e1e1e;
+    border: none;
+    border-radius: 15px;
+    min-width: 40px;
+    min-height: 40px;
+}
+#sendButton:hover {
+    background-color: #e65500;
+}
+#sendButton:pressed {
+    background-color: #cc5500;
+}
+
+/* =====================
+   Sidebar (Chats List Area, Dark)
+   ===================== */
+#sidebarFrame {
+    background-color: #2a2a2a;
+    border-right: 1px solid #505050;
+    padding: 8px;
+}
+#conversationList {
+    background-color: transparent;
+    border: none;
+    outline: none;
+}
+
+/* =====================
+   QDialogButtonBox Buttons (Dark)
+   ===================== */
+QDialogButtonBox QPushButton {
+    background-color: #4a4a4a;
+    color: #e0e0e0;
+    border-radius: 5px;
+    padding: 6px 10px;
+}
+QDialogButtonBox QPushButton:hover {
+    background-color: #5a5a5a;
+}
+QDialogButtonBox QPushButton:pressed {
+    background-color: #3a3a3a;
+}
+
+/* =====================
+   Radio Buttons (New Chat Dialog, Dark)
+   ===================== */
+QRadioButton {
+    spacing: 6px;
+    color: #e0e0e0;
+}
+QRadioButton::indicator {
+    width: 14px;
+    height: 14px;
+}
+QRadioButton::indicator:checked {
+    background-color: #ff6600;
+    border: 1px solid #4c4c4c;
+    border-radius: 7px;
+}
+QRadioButton::indicator:unchecked {
+    background-color: #2a2a2a;
+    border: 1px solid #4c4c4c;
+    border-radius: 7px;
+}
+
+/* =====================
+   QInputDialog / QFormLayout Items (Dark)
+   ===================== */
+QInputDialog, QFormLayout {
+    background-color: #2a2a2a;
+    color: #e0e0e0;
+}
+QInputDialog QLabel, QInputDialog QLineEdit {
+    font-size: 10pt;
+    color: #e0e0e0;
+}
+
+/* =====================
+   Tooltips (Dark)
+   ===================== */
+QToolTip {
+    background-color: #4c4c4c;
+    color: #e0e0e0;
+    border: none;
+    padding: 4px;
+    border-radius: 4px;
+}
+
+/* =====================
+   Disabled State for Widgets (Dark)
+   ===================== */
+QWidget:disabled {
+    background-color: #2a2a2a;
+    color: #707070;
+}
