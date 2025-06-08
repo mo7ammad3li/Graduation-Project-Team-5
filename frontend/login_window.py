@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QHBoxLayout,
     QFrame,
+    QCheckBox,
 )
 
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -128,7 +129,7 @@ class LoginWindow(QMainWindow):
         self.setCentralWidget(tabs)
 
     def _create_login_tab(self) -> QWidget:
-        # Use QFrame as container so QSS can target "loginContainer"
+        # Container so QSS can target "loginContainer"
         container = QFrame()
         container.setObjectName("loginContainer")
         layout = QVBoxLayout(container)
@@ -136,16 +137,26 @@ class LoginWindow(QMainWindow):
         form = QFormLayout()
         form.setObjectName("loginForm")
 
+        # Wallet ID
         self.login_wallet_input = QLineEdit()
         self.login_wallet_input.setObjectName("loginWalletInput")
         self.login_wallet_input.setPlaceholderText("Monero wallet ID")
         form.addRow("Wallet ID:", self.login_wallet_input)
 
+        # Password + "Show Password" checkbox
+        pwd_layout = QHBoxLayout()
         self.login_password_input = QLineEdit()
         self.login_password_input.setObjectName("loginPasswordInput")
         self.login_password_input.setEchoMode(QLineEdit.Password)
         self.login_password_input.setPlaceholderText("Password")
-        form.addRow("Password:", self.login_password_input)
+        pwd_layout.addWidget(self.login_password_input)
+
+        self.login_show_pwd_cb = QCheckBox("Show")
+        self.login_show_pwd_cb.setObjectName("loginShowPwd")
+        self.login_show_pwd_cb.stateChanged.connect(self._toggle_login_password)
+        pwd_layout.addWidget(self.login_show_pwd_cb)
+
+        form.addRow("Password:", pwd_layout)
 
         layout.addLayout(form)
 
@@ -157,7 +168,7 @@ class LoginWindow(QMainWindow):
         return container
 
     def _create_register_tab(self) -> QWidget:
-        # Use QFrame as container so QSS can target "registerContainer"
+        # Container so QSS can target "registerContainer"
         container = QFrame()
         container.setObjectName("registerContainer")
         layout = QVBoxLayout(container)
@@ -165,17 +176,28 @@ class LoginWindow(QMainWindow):
         form = QFormLayout()
         form.setObjectName("registerForm")
 
+        # Wallet ID
         self.reg_wallet_input = QLineEdit()
         self.reg_wallet_input.setObjectName("regWalletInput")
         self.reg_wallet_input.setPlaceholderText("Choose a Monero wallet ID")
         form.addRow("Wallet ID:", self.reg_wallet_input)
 
+        # Password + "Show Password" checkbox
+        pwd_layout = QHBoxLayout()
         self.reg_password_input = QLineEdit()
         self.reg_password_input.setObjectName("regPasswordInput")
         self.reg_password_input.setEchoMode(QLineEdit.Password)
         self.reg_password_input.setPlaceholderText("Choose a password")
-        form.addRow("Password:", self.reg_password_input)
+        pwd_layout.addWidget(self.reg_password_input)
 
+        self.reg_show_pwd_cb = QCheckBox("Show")
+        self.reg_show_pwd_cb.setObjectName("regShowPwd")
+        self.reg_show_pwd_cb.stateChanged.connect(self._toggle_register_password)
+        pwd_layout.addWidget(self.reg_show_pwd_cb)
+
+        form.addRow("Password:", pwd_layout)
+
+        # Subscription months
         self.reg_period_input = QLineEdit()
         self.reg_period_input.setObjectName("regPeriodInput")
         self.reg_period_input.setPlaceholderText("Subscription months (e.g. 1)")
@@ -189,6 +211,24 @@ class LoginWindow(QMainWindow):
         layout.addWidget(btn, alignment=Qt.AlignCenter)
 
         return container
+
+    def _toggle_login_password(self, state: int):
+        """
+        Show/hide the login password field based on the checkbox state.
+        """
+        if state == Qt.Checked:
+            self.login_password_input.setEchoMode(QLineEdit.Normal)
+        else:
+            self.login_password_input.setEchoMode(QLineEdit.Password)
+
+    def _toggle_register_password(self, state: int):
+        """
+        Show/hide the register password field based on the checkbox state.
+        """
+        if state == Qt.Checked:
+            self.reg_password_input.setEchoMode(QLineEdit.Normal)
+        else:
+            self.reg_password_input.setEchoMode(QLineEdit.Password)
 
     def show_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
@@ -221,7 +261,6 @@ class LoginWindow(QMainWindow):
             # RSA key rotation check
             last_rot = get_last_rsa_rotation()
             now = datetime.utcnow()
-            # If no record or older than 24h, rotate
             if (not last_rot) or ((now - last_rot) > timedelta(hours=24)):
                 # Generate new 2048-bit RSA keypair
                 new_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -230,18 +269,15 @@ class LoginWindow(QMainWindow):
                     format=serialization.PrivateFormat.PKCS8,
                     encryption_algorithm=serialization.NoEncryption()
                 )
-                # Overwrite private key file
                 priv_path = KEY_DIR / f"{w}_private_key.pem"
                 with open(priv_path, "wb") as f:
                     f.write(priv_pem)
 
-                # Serialize new public key
                 pub_pem = new_priv.public_key().public_bytes(
                     encoding=serialization.Encoding.PEM,
                     format=serialization.PublicFormat.SubjectPublicKeyInfo
                 ).decode("utf-8")
 
-                # Upload new public key to server
                 headers = {"Authorization": f"Bearer {token}"}
                 resp_upd = requests.post(
                     f"{API_BASE}/update_pubkey",
@@ -252,11 +288,9 @@ class LoginWindow(QMainWindow):
                     self.show_error("Failed to update public key on server.")
                     return
 
-                # Update last rotation timestamp
                 update_last_rsa_rotation()
                 self.privkey = new_priv
             else:
-                # Load existing private key
                 try:
                     self.privkey = load_rsa_private_key(w)
                 except Exception:
@@ -276,6 +310,24 @@ class LoginWindow(QMainWindow):
         if not (w and p and mtxt):
             self.show_error("All fields are required for registration.")
             return
+
+        # --- Strong Password Validation ---
+        if len(p) < 9:
+            self.show_error("Password must be at least 9 characters long.")
+            return
+        if not any(c.isupper() for c in p):
+            self.show_error("Password must contain at least one uppercase letter.")
+            return
+        if not any(c.islower() for c in p):
+            self.show_error("Password must contain at least one lowercase letter.")
+            return
+        if not any(c.isdigit() for c in p):
+            self.show_error("Password must contain at least one digit.")
+            return
+        if not any(not c.isalnum() for c in p):
+            self.show_error("Password must contain at least one special character.")
+            return
+        # -------------------------------------
 
         # parse months
         try:
@@ -402,7 +454,8 @@ class LoginWindow(QMainWindow):
                     self.show_error("Could not load your private key. It may be missing or corrupted.")
                     return
 
-            self.login_success.emit(access_token, username, wallet_id)
+            # Emit login_success with token and wallet_id
+            self.login_success.emit(token, w)
 
         except Exception as e:
             self.show_error(f"Server error during auto-login:\n{e}")
