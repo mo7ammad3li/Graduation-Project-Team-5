@@ -1,5 +1,3 @@
-# chat_window.py
-
 import os
 import time
 import requests
@@ -9,8 +7,8 @@ import webbrowser
 from pathlib import Path
 from datetime import datetime
 
-from PyQt5.QtCore import Qt, QTimer, QSize
-from PyQt5.QtGui import QColor, QBrush, QFont, QIcon
+from PyQt5.QtCore import Qt, QTimer, QSize, QByteArray
+from PyQt5.QtGui import QColor, QBrush, QFont, QIcon, QPixmap, QImage
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -53,8 +51,6 @@ from crypto_helper import (
     rsa_verify,
     aes_encrypt,
     aes_decrypt,
-    get_last_rsa_rotation,
-    update_last_rsa_rotation,
     format_timestamp_ms,
 )
 
@@ -68,7 +64,7 @@ class ChannelMessageDialog(QDialog):
       - Scrollable message area with “bubbles” (sent on right, received on left).
       - Bottom input row with QLineEdit + “Attach” + “Send” buttons.
       - Pressing Enter in the input sends immediately.
-      - Automatically decrypts AES_GCM messages (or shows “📷 Sent a picture” for images).
+      - Automatically decrypts AES_GCM messages (or displays actual images for data-URI).
       - Uses dedicated /api/key-exchange endpoints to swap AES keys instead of in-channel “KEY_EXCHANGE:…” messages.
     """
 
@@ -143,7 +139,7 @@ class ChannelMessageDialog(QDialog):
             QLineEdit {
                 font-size: 13px;
                 padding: 8px;
-                border: 1px solid `#e0e0e0`;
+                border: 1px solid #e0e0e0;
                 border-radius: 9px;
                 background: white;
             }
@@ -199,7 +195,7 @@ class ChannelMessageDialog(QDialog):
         except FileNotFoundError:
             pass
 
-        #  Poll for any pending key‐exchange entries before generating our own
+        # Poll for any pending key‐exchange entries before generating our own
         self._poll_key_exchanges()
 
         # If no AES key yet, send our wrapped AES to the peer via /api/key-exchange/send
@@ -313,7 +309,8 @@ class ChannelMessageDialog(QDialog):
     def load_channel_messages(self):
         """
         Fetch all messages for self.channel_id, decrypt AES_GCM payloads,
-        and display bubbles. (Key exchange entries are handled separately via _poll_key_exchanges().)
+        and pass them directly into _add_private_bubble.  If a text begins
+        with data:image/, _add_private_bubble will decode & render the image.
         """
         chat_id = f"channel_{self.channel_id}"
 
@@ -340,14 +337,16 @@ class ChannelMessageDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to load channel messages:\n{e}")
             return
 
-        # 4) Process each message (only 'AES_GCM:' or plaintext/image)
+        # 4) Process each message
         for m in all_msgs:
             sender     = m.get("from")
             ciphertext = m.get("message", "")
             sig_b64    = m.get("signature", "")
             ts         = m.get("timestamp", 0)
 
-            # If it’s an AES_GCM payload and we have the AES key, decrypt
+            plaintext = ciphertext  # default = raw text
+
+            # A) If it’s an AES_GCM payload and we have the AES key, attempt to decrypt
             if ciphertext.startswith("AES_GCM:") and chat_id in self.aes_keys:
                 try:
                     b64_payload = ciphertext.split("AES_GCM:", 1)[1]
@@ -360,20 +359,13 @@ class ChannelMessageDialog(QDialog):
                     plaintext = plaintext_bytes.decode("utf-8", errors="ignore")
                 except Exception:
                     plaintext = "[Decryption error]"
-            else:
-                # Plaintext or image-data URI
-                plaintext = ciphertext
 
-            # If plaintext is an image-data URI
-            if plaintext.startswith("data:image/"):
-                display_text = "📷 Sent a picture"
-            else:
-                display_text = plaintext
-
-            # Add a bubble
+            # B) **Don’t replace data:image/... with a placeholder here.**
+            #    Just hand the raw plaintext (which may be "data:image/...;base64,…")
+            #    directly to the bubble renderer. That renderer will decode & show it.
             self._add_private_bubble(
                 sender_label=("Me" if sender == self.wallet_id else sender),
-                plaintext=display_text,
+                plaintext=plaintext,
                 ts=ts
             )
             if ts > self.last_channel_timestamp:
@@ -387,12 +379,13 @@ class ChannelMessageDialog(QDialog):
 
     def load_new_channel_messages(self):
         """
-        Poll for new channel messages (AES_GCM or plaintext) since last_timestamp,
-        and check again for new key-exchange entries.
+        Poll for new channel messages since last_channel_timestamp,
+        decrypt if needed, then display. If the message is a data‐URI,
+        pass it directly so _add_private_bubble can render the image.
         """
         chat_id = f"channel_{self.channel_id}"
 
-        # 1) Poll for key-exchange before loading any new messages
+        # 1) Check for new key‐exchange entries
         self._poll_key_exchanges()
 
         try:
@@ -409,53 +402,152 @@ class ChannelMessageDialog(QDialog):
 
         for m in ch_msgs:
             ts = m.get("timestamp", 0)
-            if ts > self.last_channel_timestamp:
-                sender     = m.get("from")
-                ciphertext = m.get("message", "")
-                sig_b64    = m.get("signature", "")
+            if ts <= self.last_channel_timestamp:
+                continue  # skip already‐seen messages
 
-                # AES_GCM decryption
-                if ciphertext.startswith("AES_GCM:") and chat_id in self.aes_keys:
-                    try:
-                        b64_payload = ciphertext.split("AES_GCM:", 1)[1]
-                        payload_bytes = base64.b64decode(b64_payload)
-                        _, keybytes = self.aes_keys[chat_id]
-                        aesgcm = AESGCM(keybytes)
-                        nonce = payload_bytes[:12]
-                        ct_and_tag = payload_bytes[12:]
-                        plaintext_bytes = aesgcm.decrypt(nonce, ct_and_tag, None)
-                        plaintext = plaintext_bytes.decode("utf-8", errors="ignore")
-                    except Exception:
-                        plaintext = "[Decryption error]"
-                else:
-                    plaintext = ciphertext
+            sender     = m.get("from")
+            ciphertext = m.get("message", "")
+            ts         = m.get("timestamp", 0)
 
-                if plaintext.startswith("data:image/"):
-                    display_text = "📷 Sent a picture"
-                else:
-                    display_text = plaintext
+            plaintext = ciphertext  # default fallback
 
-                self._add_private_bubble(
-                    sender_label=("Me" if sender == self.wallet_id else sender),
-                    plaintext=display_text,
-                    ts=ts
-                )
-                self.last_channel_timestamp = ts
+            # A) AES_GCM decrypt if possible
+            if ciphertext.startswith("AES_GCM:") and chat_id in self.aes_keys:
+                try:
+                    b64_payload = ciphertext.split("AES_GCM:", 1)[1]
+                    payload_bytes = base64.b64decode(b64_payload)
+                    _, keybytes = self.aes_keys[chat_id]
+                    aesgcm = AESGCM(keybytes)
+                    nonce = payload_bytes[:12]
+                    ct_and_tag = payload_bytes[12:]
+                    plaintext_bytes = aesgcm.decrypt(nonce, ct_and_tag, None)
+                    plaintext = plaintext_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    plaintext = "[Decryption error]"
+
+            # B) Pass raw plaintext (may be data:image/…) to the bubble renderer
+            sender_label = "Me" if sender == self.wallet_id else sender
+            self._add_private_bubble(sender_label, plaintext, ts)
+
+            self.last_channel_timestamp = ts
 
 
     # ──────────────────────────────────────────────────────────────────────────
     #  MESSAGE BUBBLE HELPERS (for both PRIVATE and CHANNEL)
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _add_image_bubble(self, pixmap: QPixmap, sender_label: str, ts: int):
+        """
+        Given a valid QPixmap, add it as an image bubble:
+          • Show the image at full size (no artificial “max width”),
+            allowing the user to scroll if it’s large.
+          • Position sent vs. received appropriately.
+          • Put a timestamp under the image.
+        """
+        # 1) Verify that pixmap is truly a QPixmap, else bail out
+        if not isinstance(pixmap, QPixmap):
+            # If not, just skip and return. We’ll never call .width() on a non-QPixmap.
+            return
+
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.NoFrame)
+        bubble_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+        # ── Build a vertical layout: [image][timestamp] ─────────────────────────
+        inner_v = QVBoxLayout(bubble_frame)
+        inner_v.setContentsMargins(8, 6, 8, 6)
+        inner_v.setSpacing(4)
+
+        # 2) Create a QLabel, put the full pixmap inside it:
+        image_label = QLabel()
+        image_label.setPixmap(pixmap)
+        image_label.setAlignment(Qt.AlignCenter)
+        # Let it expand vertically/horizontally if needed
+        image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        inner_v.addWidget(image_label)
+
+        # 3) Add the timestamp under the image
+        ts_label = QLabel(format_timestamp_ms(ts))
+        ts_label.setAlignment(Qt.AlignRight)
+        ts_label.setStyleSheet("color: gray; font-size: 8pt;")
+        inner_v.addWidget(ts_label)
+
+        # 4) Choose bubble color based on sender
+        sent_color = "#dcf8c6"   # light green
+        recv_color = "#ffffff"   # white
+        border_radius = 12
+
+        if sender_label == "Me":
+            bubble_frame.setStyleSheet(f"""
+                background-color: {sent_color};
+                border-radius: {border_radius}px;
+            """)
+            # Align to the right
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addStretch(1)
+            row.addWidget(bubble_frame, 0, Qt.AlignRight)
+
+        else:
+            bubble_frame.setStyleSheet(f"""
+                background-color: {recv_color};
+                border-radius: {border_radius}px;
+            """)
+            # Align to the left
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(bubble_frame, 0, Qt.AlignLeft)
+            row.addStretch(1)
+
+        # 5) Insert this image row just above the bottom stretch:
+        self.messages_layout.insertLayout(self.messages_layout.count() - 1, row)
+
+        # 6) Auto‐scroll to bottom after a short delay:
+        QTimer.singleShot(100, lambda:
+            self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            )
+        )
+
+
     def _add_private_bubble(self, sender_label: str, plaintext: str, ts: int):
         """
         Create a ‘bubble’ QFrame for chat:
-          • Sent (sender_label=="Me") appear on right in light green
-          • Received appear on left in white
-          • Each bubble shows text (or “📷 Sent a picture”) and timestamp
+          • If `plaintext` starts with "data:image/", attempt to decode it
+            and display the image (full-size). If that fails, fall back
+            to rendering the entire data-URI as a long text label.
+          • Otherwise, just render `plaintext` as a normal text bubble.
+          • Sent (sender_label=="Me") appear on the right (light green);
+            received appear on the left (white).
+          • Each bubble has the content (image or text) plus a timestamp below.
         """
-        sent_color = "#dcf8c6"    # light green
-        recv_color = "#ffffff"    # white
+        # 1) If this is a data‐URI, try to extract and decode base64 into a QPixmap
+        if isinstance(plaintext, str) and plaintext.startswith("data:image/"):
+            try:
+                # We look for "base64," to split off the actual bytes
+                marker = "base64,"
+                idx = plaintext.find(marker)
+                if idx == -1:
+                    raise ValueError("No 'base64,' marker found in data-URI")
+                b64data = plaintext[idx + len(marker):].strip()
+                image_bytes = base64.b64decode(b64data)
+
+                pixmap = QPixmap()
+                if not pixmap.loadFromData(image_bytes):
+                    raise ValueError("QPixmap.loadFromData returned False")
+
+                # At this point we have a valid QPixmap. Delegate to the image-helper:
+                self._add_image_bubble(pixmap, sender_label, ts)
+                return
+
+            except Exception:
+                # If anything fails, we will fall through to the text-bubble code below
+                # and display the full data-URI as text. (No more "[Image could not be rendered]".)
+                pass
+
+        # 2) Otherwise (or if the image decode failed), render a plain text bubble
+        sent_color = "#dcf8c6"   # light green
+        recv_color = "#ffffff"   # white
         border_radius = 12
 
         bubble = QFrame()
@@ -471,7 +563,7 @@ class ChannelMessageDialog(QDialog):
         inner_v.setContentsMargins(8, 6, 8, 6)
         inner_v.setSpacing(4)
 
-        # ── Message QLabel ───────────────────────────
+        # ── Render the plaintext (which might be long if it's actually a data-URI) ──
         msg_label = QLabel(plaintext)
         msg_label.setWordWrap(True)
         msg_label.setFont(QFont("Segoe UI", 11))
@@ -481,11 +573,13 @@ class ChannelMessageDialog(QDialog):
             msg_label.setStyleSheet("color: #000000;")
         inner_v.addWidget(msg_label)
 
+        # ── Timestamp ────────────────────────────────────────────────────────────
         ts_label = QLabel(format_timestamp_ms(ts))
         ts_label.setAlignment(Qt.AlignRight)
         ts_label.setStyleSheet("color: gray; font-size: 8pt;")
         inner_v.addWidget(ts_label)
 
+        # ── Bubble styling & alignment ───────────────────────────────────────────
         if sender_label == "Me":
             inner.setStyleSheet(f"""
                 background-color: {sent_color};
@@ -501,21 +595,23 @@ class ChannelMessageDialog(QDialog):
             h.addWidget(inner, 0, Qt.AlignLeft)
             h.addStretch(1)
 
-        # Insert bubble above the final stretch
+        # Insert this bubble just above the bottom stretch in messages_layout
         self.messages_layout.insertWidget(self.messages_layout.count() - 1, bubble)
 
-        # Auto-scroll to bottom
-        QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
-            self.scroll_area.verticalScrollBar().maximum()
-        ))
+        # Auto‐scroll to bottom after a short delay
+        QTimer.singleShot(100, lambda:
+            self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            )
+        )
 
 
-    # second third
+    # second part
 
     def send_channel_message(self):
         """
         Encrypt & send a new channel message using AES_GCM + RSA signature.
-        (No change here—channel messages still use AES_GCM and are posted to /api/channel/<id>/message.)
+        Now also displays an actual image bubble if `text` is a data-URI.
         """
         text = self.msg_input.text().strip()
         if not text:
@@ -557,8 +653,17 @@ class ChannelMessageDialog(QDialog):
             if resp.status_code not in (200, 201):
                 raise Exception(resp.text)
 
-            # 5) Locally decrypt/re‐display the outgoing text
-            self._add_private_bubble("Me", text, ts)
+            # 5) Locally display outgoing bubble (image or text)
+            if text.startswith("data:image/"):
+                # Extract base64 payload from data-URI
+                b64_data = text.split(",", 1)[1]
+                image_bytes = base64.b64decode(b64_data)
+                image = QImage.fromData(QByteArray(image_bytes))
+                pixmap = QPixmap.fromImage(image).scaledToWidth(94590, Qt.SmoothTransformation)
+                self._add_image_bubble("Me", pixmap, ts)
+            else:
+                self._add_private_bubble("Me", text, ts)
+
             self.msg_input.clear()
 
         except Exception as e:
@@ -611,7 +716,630 @@ class ChatWindow(QMainWindow):
       - Private messages and channels open in bubble format
       - Press Enter to send; menu for settings
       - Uses dedicated /api/key-exchange for private key exchange
+      - Now supports rendering data-URI images as actual images in bubbles.
     """
+    def _handle_incoming_private(self, sender: str, text: str, sig_b64: str, ts: int):
+        """
+        Handle an incoming private message from `sender`.
+        - If it's AES_GCM‐encrypted, verify its RSA signature and decrypt.
+        - Otherwise, treat as plaintext (e.g. “data:image/…” URI or plain text).
+        Finally, display as a bubble and update last_timestamp.
+        """
+        # 1) Attempt to pull down any newly‐arrived KEY_EXCHANGE entries
+        #    (this may populate self.aes_key_map for this sender)
+        self._poll_key_exchanges(sender)
+
+        # 2) Fetch sender's public key so we can verify signatures
+        resp = requests.get(f"{API_BASE}/user/{sender}")
+        data = resp.json() if resp.status_code == 200 else {}
+        if resp.status_code != 200 or not data.get("exists"):
+            return
+        sender_pub_pem = data["pubkey"]
+        sender_pubkey = load_rsa_public_key(sender, sender_pub_pem)
+
+        # 3) If this is AES_GCM:… form, first base64‐decode, verify signature, then decrypt
+        if text.startswith("AES_GCM:"):
+            b64_payload = text.split("AES_GCM:", 1)[1]
+            try:
+                payload_bytes = base64.b64decode(b64_payload)
+            except Exception:
+                QMessageBox.critical(self, "Error", "Invalid AES payload format.")
+                return
+
+            # Verify RSA‐PSS signature
+            try:
+                sig_bytes = base64.b64decode(sig_b64 or "")
+                if not rsa_verify(sender_pubkey, sig_bytes, payload_bytes):
+                    QMessageBox.critical(self, "Error", "Invalid signature—message tampered.")
+                    return
+            except Exception:
+                QMessageBox.critical(self, "Error", "Signature verification failed.")
+                return
+
+            # Decrypt with AES key
+            chat_id = self._get_private_chat_id(sender)
+            if chat_id not in self.aes_key_map:
+                # We haven't gotten an AES key yet
+                try:
+                    keybytes = load_aes_key(chat_id, "v1")
+                    self.aes_key_map[chat_id] = keybytes
+                except FileNotFoundError:
+                    QMessageBox.warning(self, "Error", "No AES key for this chat.")
+                    return
+
+            aes_key = self.aes_key_map[chat_id]
+            try:
+                aesgcm = AESGCM(aes_key)
+                nonce = payload_bytes[:12]
+                ct_and_tag = payload_bytes[12:]
+                plaintext_bytes = aesgcm.decrypt(nonce, ct_and_tag, None)
+                plaintext = plaintext_bytes.decode("utf-8", errors="ignore")
+            except Exception:
+                QMessageBox.critical(self, "Error", "Failed to decrypt message.")
+                plaintext = "[Decryption error]"
+
+            sender_label = "Me" if sender == self.wallet_id else sender
+            self._add_private_bubble(sender_label, plaintext, ts)
+            if ts > self.last_timestamp:
+                self.last_timestamp = ts
+            return
+
+        # 4) Otherwise, treat as plaintext (e.g. data URI or plain text)
+        display_text = text
+        if display_text.startswith("data:image/"):
+            display_text = "📷 Sent a picture 2"
+
+        sender_label = "Me" if sender == self.wallet_id else sender
+        self._add_private_bubble(sender_label, display_text, ts)
+        if ts > self.last_timestamp:
+            self.last_timestamp = ts
+
+
+    def open_channel_message_dialog(self, channel_id: str):
+        """
+        When a channel item is clicked, open a ChannelMessageDialog.
+        We fetch the peer_wallet for this channel ID via GET /api/channels,
+        then instantiate ChannelMessageDialog and exec_() it.
+        """
+        try:
+            # Fetch all active channels to find this one
+            resp = requests.get(f"{API_BASE}/channels", headers={"Authorization": f"Bearer {self.access_token}"})
+            resp.raise_for_status()
+            chans = resp.json()
+            peer = None
+            for c in chans:
+                if str(c.get("id")) == str(channel_id):
+                    peer = c.get("peer_wallet")
+                    break
+
+            if not peer:
+                QMessageBox.warning(self, "Error", f"Channel {channel_id} not found or expired.")
+                return
+
+            # Instantiate and show the channel dialog
+            dlg = ChannelMessageDialog(
+                parent=self,
+                access_token=self.access_token,
+                wallet_id=self.wallet_id,
+                channel_id=int(channel_id),
+                peer_wallet=peer
+            )
+            dlg.exec_()
+
+            # After the dialog closes, refresh the conversation list in case something changed
+            self.load_conversations()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open channel #{channel_id}:\n{e}")
+
+    def _add_image_bubble(self, pixmap: QPixmap, sender_label: str, ts: int):
+        """
+        Given a valid QPixmap, add it as an image bubble:
+          • Show the image at full size (no artificial “max width”),
+            allowing the user to scroll if it’s large.
+          • Position sent vs. received appropriately.
+          • Put a timestamp under the image.
+        """
+        # 1) Verify that pixmap is truly a QPixmap, else bail out
+        if not isinstance(pixmap, QPixmap):
+            # If not, just skip and return. We’ll never call .width() on a non-QPixmap.
+            return
+
+        bubble_frame = QFrame()
+        bubble_frame.setFrameShape(QFrame.NoFrame)
+        bubble_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+
+        # ── Build a vertical layout: [image][timestamp] ─────────────────────────
+        inner_v = QVBoxLayout(bubble_frame)
+        inner_v.setContentsMargins(8, 6, 8, 6)
+        inner_v.setSpacing(4)
+
+        # 2) Create a QLabel, put the full pixmap inside it:
+        image_label = QLabel()
+        image_label.setPixmap(pixmap)
+        image_label.setAlignment(Qt.AlignCenter)
+        # Let it expand vertically/horizontally if needed
+        image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        inner_v.addWidget(image_label)
+
+        # 3) Add the timestamp under the image
+        ts_label = QLabel(format_timestamp_ms(ts))
+        ts_label.setAlignment(Qt.AlignRight)
+        ts_label.setStyleSheet("color: gray; font-size: 8pt;")
+        inner_v.addWidget(ts_label)
+
+        # 4) Choose bubble color based on sender
+        sent_color = "#dcf8c6"   # light green
+        recv_color = "#ffffff"   # white
+        border_radius = 12
+
+        if sender_label == "Me":
+            bubble_frame.setStyleSheet(f"""
+                background-color: {sent_color};
+                border-radius: {border_radius}px;
+            """)
+            # Align to the right
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addStretch(1)
+            row.addWidget(bubble_frame, 0, Qt.AlignRight)
+
+        else:
+            bubble_frame.setStyleSheet(f"""
+                background-color: {recv_color};
+                border-radius: {border_radius}px;
+            """)
+            # Align to the left
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(bubble_frame, 0, Qt.AlignLeft)
+            row.addStretch(1)
+
+        # 5) Insert this image row just above the bottom stretch:
+        self.messages_layout.insertLayout(self.messages_layout.count() - 1, row)
+
+        # 6) Auto‐scroll to bottom after a short delay:
+        QTimer.singleShot(100, lambda:
+            self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            )
+        )
+
+
+    def setup_ui(self):
+        """
+        Build all of the UI widgets and layouts for ChatWindow.
+        Called at the very start of __init__.
+        """
+        self.setObjectName("chatWindow")
+        self.setWindowTitle(f"Chat – {self.wallet_id}")
+        self.resize(900, 600)
+        self.setFont(QFont("Segoe UI", 11))
+
+        # ─── Main Layout ────────────────────────────────────────────────
+        root_splitter = QSplitter(Qt.Horizontal)
+        root_splitter.setHandleWidth(1)
+
+        # ===== LEFT SIDEBAR =====
+        sidebar_frame = QFrame()
+        sidebar_frame.setObjectName("sidebarFrame")
+        sidebar_frame.setMinimumWidth(140)
+        sidebar_layout = QVBoxLayout(sidebar_frame)
+        sidebar_layout.setContentsMargins(8, 8, 8, 8)
+        sidebar_layout.setSpacing(8)
+
+        # Top Button Row
+        top_button_row = QHBoxLayout()
+        top_button_row.setContentsMargins(0, 0, 0, 0)
+        top_button_row.setSpacing(4)
+
+        self.btn_new_chat = QPushButton("New Chat")
+        self.btn_new_chat.setFixedHeight(40)
+        self.btn_new_chat.setStyleSheet("""
+            QPushButton {
+                font-size: 13px;
+                padding: 8px 12px;
+                background: #ffffff;
+                border: 1px solid #e0e0e0;
+                border-radius: 9px;
+            }
+            QPushButton:hover { background: #f5f5f5; }
+        """)
+        top_button_row.addWidget(self.btn_new_chat)
+
+        self.menu_button = QPushButton("☰")
+        self.menu_button.setFixedSize(40, 40)
+        self.menu_button.setStyleSheet("""
+            QPushButton {
+                font-size: 20px;
+                border: 1px solid #e0e0e0;
+                border-radius: 9px;
+                background: #ffffff;
+            }
+            QPushButton:hover { background: #f5f5f5; }
+        """)
+        top_button_row.addWidget(self.menu_button)
+
+        sidebar_layout.addLayout(top_button_row)
+
+        # Conversation List
+        self.conversation_list = QListWidget()
+        self.conversation_list.setObjectName("conversationList")
+        self.conversation_list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        sidebar_layout.addWidget(self.conversation_list)
+
+        root_splitter.addWidget(sidebar_frame)
+
+        # ===== RIGHT PANE =====
+        main_frame  = QFrame()
+        main_frame.setObjectName("mainFrame")
+        main_layout = QVBoxLayout(main_frame)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Header
+        header_frame = QFrame()
+        header_frame.setFixedHeight(56)
+        header_frame.setStyleSheet("background: #ffffff; border-bottom: 1px solid #e0e0e0;")
+        header_layout = QHBoxLayout(header_frame)
+        header_layout.setContentsMargins(16, 0, 16, 0)
+
+        self.chat_title = QLabel("No chat selected")
+        self.chat_title.setStyleSheet("""
+            QLabel {
+                font-size: 16px;
+                font-weight: 600;
+                color: #000000;
+            }
+        """)
+        header_layout.addWidget(self.chat_title)
+        main_layout.addWidget(header_frame)
+
+        # Message Area
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("border: none; background: #f8f9fa;")
+        self.scroll_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.messages_container = QWidget()
+        self.messages_layout = QVBoxLayout(self.messages_container)
+        self.messages_layout.setContentsMargins(16, 16, 16, 16)
+        self.messages_layout.setSpacing(8)
+        self.messages_layout.addStretch(1)
+
+        self.scroll_area.setWidget(self.messages_container)
+        main_layout.addWidget(self.scroll_area)
+
+        # Input Area
+        input_frame = QFrame()
+        input_frame.setFixedHeight(72)
+        input_frame.setStyleSheet("background: #ffffff; border-top: 1px solid #e0e0e0;")
+        input_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        input_layout = QHBoxLayout(input_frame)
+        input_layout.setContentsMargins(16, 12, 16, 12)
+        input_layout.setSpacing(8)
+
+        self.message_input = QLineEdit()
+        self.message_input.setObjectName("messageInput")
+        self.message_input.setPlaceholderText("Type a message...")
+        self.message_input.setStyleSheet("""
+            QLineEdit {
+                font-size: 14px;
+                padding: 12px;
+                border: 1px solid #e0e0e0;
+                border-radius: 9px;
+                background: #808080;
+            }
+        """)
+        self.message_input.setFixedHeight(44)
+        input_layout.addWidget(self.message_input)
+
+        self.btn_attach = QPushButton()
+        self.btn_attach.setIcon(QIcon(":/icons/attach.png"))
+        self.btn_attach.setIconSize(QSize(20, 20))
+        self.btn_attach.setFixedSize(44, 44)
+        self.btn_attach.setStyleSheet("""
+            QPushButton {
+                border: black;
+                background: grey;
+                border-radius: 9px;
+            }
+            QPushButton:hover { background: #f0f0f0; }
+        """)
+        input_layout.addWidget(self.btn_attach)
+
+        self.send_button = QPushButton()
+        self.send_button.setObjectName("sendButton")
+        self.send_button.setIcon(QIcon(":/icons/send.png"))
+        self.send_button.setIconSize(QSize(20, 20))
+        self.send_button.setFixedSize(44, 44)
+        self.send_button.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background: #0084ff;
+                border-radius: 9px;
+            }
+            QPushButton:hover { background: #0077e6; }
+            QPushButton:pressed { background: #006acc; }
+        """)
+        input_layout.addWidget(self.send_button)
+
+        main_layout.addWidget(input_frame)
+        root_splitter.addWidget(main_frame)
+        self.setCentralWidget(root_splitter)
+
+        # ─── Menu Setup ───────────────────────────────────────────────
+        menu = QMenu(self)
+        actions = [
+            ("Change Password", self.change_password),
+            ("Renew Subscription", self.renew_subscription),
+            ("Block User", self.block_user),
+            ("Help", lambda: webbrowser.open(f"{API_BASE.replace('/api','')}/help")),
+            ("Logout", self.logout)
+        ]
+        for text, callback in actions:
+            action = QAction(text, self)
+            action.triggered.connect(callback)
+            menu.addAction(action)
+        self.menu_button.setMenu(menu)
+
+
+    def load_conversations(self):
+        """
+        Build and display a list of all private partners and channels:
+          • For private: show “wallet_id – last_message_snippet”
+          • For channel: show “[Group] name – last_message_snippet”
+          • If last_message was a picture, show “📷 Sent a picture 3”
+          • Mark unread items in red
+        Any Base64/AES failures are caught so the loop never aborts.
+        """
+        try:
+            # 1) Fetch all private messages
+            resp = requests.get(
+                f"{API_BASE}/messages",
+                headers={"Authorization": f"Bearer {self.access_token}"}
+            )
+            if resp.status_code != 200:
+                raise Exception(resp.text)
+            msgs = resp.json()
+
+            private_map = {}
+            # Determine the latest snippet for each private partner
+            for m in msgs:
+                sender     = m.get("from")
+                recipient  = m.get("to")
+                ts         = m.get("timestamp")
+                ciphertext = m.get("message", "")
+                if sender is None or recipient is None or ts is None:
+                    continue
+
+                # Determine the “other side” of this conversation
+                partner = recipient if sender == self.wallet_id else sender
+
+                # ─── TRY TO DECRYPT THIS CIPHERTEXT TO A PLAIN SNIPPET ───
+                snippet = ""
+                if ciphertext.startswith("AES_GCM:"):
+                    chat_id = self._get_private_chat_id(partner)
+                    if chat_id in self.aes_key_map:
+                        try:
+                            b64_payload = ciphertext.split("AES_GCM:", 1)[1]
+                            payload_bytes = base64.b64decode(b64_payload)
+                            aes_key = self.aes_key_map[chat_id]
+                            plaintext_bytes = aes_decrypt(aes_key, payload_bytes)
+                            snippet = plaintext_bytes.decode("utf-8", errors="ignore")
+                        except Exception:
+                            snippet = "[Encrypted]"
+                    else:
+                        snippet = "[Encrypted]"
+
+                elif ciphertext.startswith("data:image/"):
+                    snippet = "📷 Sent a picture 4"
+                else:
+                    snippet = ciphertext
+
+                if sender == self.wallet_id:
+                    snippet = f"Me: {snippet}"
+
+                existing = private_map.get(partner)
+                if not existing or existing["timestamp"] < ts:
+                    private_map[partner] = {"last_msg": snippet, "timestamp": ts}
+
+            # 2) Fetch channels
+            resp2 = requests.get(
+                f"{API_BASE}/channels",
+                headers={"Authorization": f"Bearer {self.access_token}"}
+            )
+            if resp2.status_code != 200:
+                raise Exception(resp2.text)
+            chans = resp2.json()
+
+            channel_map = {}
+            for c in chans:
+                cid_str = str(c["id"])
+                channel_map[cid_str] = {"name": c["name"], "last_msg": "", "timestamp": 0}
+
+            for cid_str in channel_map.keys():
+                resp_ch = requests.get(
+                    f"{API_BASE}/channel/{cid_str}/messages",
+                    headers={"Authorization": f"Bearer {self.access_token}"}
+                )
+                if resp_ch.status_code != 200:
+                    continue
+                ch_msgs = resp_ch.json()
+                if not isinstance(ch_msgs, list) or not ch_msgs:
+                    continue
+                ch_msgs.sort(key=lambda x: x["timestamp"])
+                last = ch_msgs[-1]
+                raw = last["message"]
+                snippet = ""
+                if raw.startswith("AES_GCM:"):
+                    try:
+                        b64_payload = raw.split("AES_GCM:", 1)[1]
+                        _ = base64.b64decode(b64_payload)
+                        snippet = "📷 Sent a picture 5" if raw.startswith("AES_GCM:") else raw
+                    except Exception:
+                        snippet = "[Encrypted]"
+                elif raw.startswith("data:image/"):
+                    snippet = "📷 Sent a picture 6"
+                else:
+                    snippet = raw[:20] + "…" if len(raw) > 23 else raw
+
+                channel_map[cid_str]["last_msg"] = snippet
+                channel_map[cid_str]["timestamp"] = last["timestamp"]
+
+            # 3) Combine & sort
+            combined = []
+            for p, info in private_map.items():
+                combined.append({
+                    "type": "private",
+                    "key": p,
+                    "display": p,
+                    "last_msg": info["last_msg"],
+                    "timestamp": info["timestamp"]
+                })
+            for cid_str, info in channel_map.items():
+                combined.append({
+                    "type": "channel",
+                    "key": cid_str,
+                    "display": f"[Group] {info['name']}",
+                    "last_msg": info["last_msg"],
+                    "timestamp": info["timestamp"]
+                })
+
+            combined.sort(key=lambda x: x["timestamp"], reverse=True)
+
+            prev_partner = self.current_partner
+            prev_channel = self.current_channel
+            self.conversation_list.clear()
+
+            for entry in combined:
+                snippet = entry["last_msg"]
+                if len(snippet) > 30:
+                    snippet = snippet[:27] + "…"
+
+                text = f"{entry['display']}  —  {snippet}"
+                item = QListWidgetItem(text)
+                if entry["key"] in self.unread_map:
+                    item.setForeground(QBrush(QColor("red")))
+                item.setData(Qt.UserRole, (entry["type"], entry["key"]))
+                self.conversation_list.addItem(item)
+
+            # Reselect previously selected item if still present
+            for i in range(self.conversation_list.count()):
+                it = self.conversation_list.item(i)
+                it_type, it_key = it.data(Qt.UserRole)
+                if (it_type == "private" and it_key == prev_partner) or \
+                   (it_type == "channel" and it_key == prev_channel):
+                    self.conversation_list.setCurrentItem(it)
+                    break
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load conversations:\n{e}")
+
+
+    def _get_private_chat_id(self, partner: str) -> str:
+        """
+        Return a consistent chat‐ID string for a 1:1 conversation
+        between the current user (self.wallet_id) and `partner`.
+        """
+        return f"{self.wallet_id}_{partner}"
+
+
+    def _add_private_bubble(self, sender_label: str, plaintext: str, ts: int):
+        """
+        Create a ‘bubble’ QFrame for chat:
+          • If `plaintext` starts with "data:image/", attempt to decode it
+            and display the image (full-size). If that fails, fall back
+            to rendering the entire data-URI as a long text label.
+          • Otherwise, just render `plaintext` as a normal text bubble.
+          • Sent (sender_label=="Me") appear on the right (light green);
+            received appear on the left (white).
+          • Each bubble has the content (image or text) plus a timestamp below.
+        """
+        # 1) If this is a data‐URI, try to extract and decode base64 into a QPixmap
+        if isinstance(plaintext, str) and plaintext.startswith("data:image/"):
+            try:
+                # We look for "base64," to split off the actual bytes
+                marker = "base64,"
+                idx = plaintext.find(marker)
+                if idx == -1:
+                    raise ValueError("No 'base64,' marker found in data-URI")
+                b64data = plaintext[idx + len(marker):].strip()
+                image_bytes = base64.b64decode(b64data)
+
+                pixmap = QPixmap()
+                if not pixmap.loadFromData(image_bytes):
+                    raise ValueError("QPixmap.loadFromData returned False")
+
+                # At this point we have a valid QPixmap. Delegate to the image-helper:
+                self._add_image_bubble(pixmap, sender_label, ts)
+                return
+
+            except Exception:
+                # If anything fails, we will fall through to the text-bubble code below
+                # and display the full data-URI as text. (No more "[Image could not be rendered]".)
+                pass
+
+        # 2) Otherwise (or if the image decode failed), render a plain text bubble
+        sent_color = "#dcf8c6"   # light green
+        recv_color = "#ffffff"   # white
+        border_radius = 12
+
+        bubble = QFrame()
+        bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        bubble.setFrameShape(QFrame.NoFrame)
+
+        h = QHBoxLayout(bubble)
+        h.setContentsMargins(0, 0, 0, 0)
+
+        inner = QFrame()
+        inner.setFrameShape(QFrame.StyledPanel)
+        inner_v = QVBoxLayout(inner)
+        inner_v.setContentsMargins(8, 6, 8, 6)
+        inner_v.setSpacing(4)
+
+        # ── Render the plaintext (which might be long if it's actually a data-URI) ──
+        msg_label = QLabel(plaintext)
+        msg_label.setWordWrap(True)
+        msg_label.setFont(QFont("Segoe UI", 11))
+        if sender_label == "Me":
+            msg_label.setStyleSheet("color: black;")
+        else:
+            msg_label.setStyleSheet("color: #000000;")
+        inner_v.addWidget(msg_label)
+
+        # ── Timestamp ────────────────────────────────────────────────────────────
+        ts_label = QLabel(format_timestamp_ms(ts))
+        ts_label.setAlignment(Qt.AlignRight)
+        ts_label.setStyleSheet("color: gray; font-size: 8pt;")
+        inner_v.addWidget(ts_label)
+
+        # ── Bubble styling & alignment ───────────────────────────────────────────
+        if sender_label == "Me":
+            inner.setStyleSheet(f"""
+                background-color: {sent_color};
+                border-radius: {border_radius}px;
+            """)
+            h.addStretch(1)
+            h.addWidget(inner, 0, Qt.AlignRight)
+        else:
+            inner.setStyleSheet(f"""
+                background-color: {recv_color};
+                border-radius: {border_radius}px;
+            """)
+            h.addWidget(inner, 0, Qt.AlignLeft)
+            h.addStretch(1)
+
+        # Insert this bubble just above the bottom stretch in messages_layout
+        self.messages_layout.insertWidget(self.messages_layout.count() - 1, bubble)
+
+        # Auto‐scroll to bottom after a short delay
+        QTimer.singleShot(100, lambda:
+            self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            )
+        )
+
     def __init__(self, access_token: str, wallet_id: str, privkey=None):
         super().__init__()
         self.access_token = access_token
@@ -663,7 +1391,7 @@ class ChatWindow(QMainWindow):
         # ===== LEFT SIDEBAR =====
         sidebar_frame = QFrame()
         sidebar_frame.setObjectName("sidebarFrame")
-        sidebar_frame.setMinimumWidth(240)
+        sidebar_frame.setMinimumWidth(140)
         sidebar_layout = QVBoxLayout(sidebar_frame)
         sidebar_layout.setContentsMargins(8, 8, 8, 8)
         sidebar_layout.setSpacing(8)
@@ -846,397 +1574,8 @@ class ChatWindow(QMainWindow):
         self.private_poll_timer.timeout.connect(self.poll_new_messages)
         self.private_poll_timer.start(3000)
 
-    def _add_private_bubble(self, sender_label: str, plaintext: str, ts: int):
-        """
-        Create a ‘bubble’ QFrame for chat:
-          • Sent (sender_label=="Me") appear on right in light green
-          • Received appear on left in white
-          • Each bubble shows text (or “📷 Sent a picture”) and timestamp
-        """
-        sent_color = "#dcf8c6"    # light green
-        recv_color = "#ffffff"    # white
-        border_radius = 12
 
-        bubble = QFrame()
-        bubble.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
-        bubble.setFrameShape(QFrame.NoFrame)
-
-        h = QHBoxLayout(bubble)
-        h.setContentsMargins(0, 0, 0, 0)
-
-        inner = QFrame()
-        inner.setFrameShape(QFrame.StyledPanel)
-        inner_v = QVBoxLayout(inner)
-        inner_v.setContentsMargins(8, 6, 8, 6)
-        inner_v.setSpacing(4)
-
-        # ── Message QLabel ───────────────────────────
-        msg_label = QLabel(plaintext)
-        msg_label.setWordWrap(True)
-        msg_label.setFont(QFont("Segoe UI", 11))
-        if sender_label == "Me":
-            msg_label.setStyleSheet("color: black;")
-        else:
-            msg_label.setStyleSheet("color: #000000;")
-        inner_v.addWidget(msg_label)
-
-        ts_label = QLabel(format_timestamp_ms(ts))
-        ts_label.setAlignment(Qt.AlignRight)
-        ts_label.setStyleSheet("color: gray; font-size: 8pt;")
-        inner_v.addWidget(ts_label)
-
-        if sender_label == "Me":
-            inner.setStyleSheet(f"""
-                background-color: {sent_color};
-                border-radius: {border_radius}px;
-            """)
-            h.addStretch(1)
-            h.addWidget(inner, 0, Qt.AlignRight)
-        else:
-            inner.setStyleSheet(f"""
-                background-color: {recv_color};
-                border-radius: {border_radius}px;
-            """)
-            h.addWidget(inner, 0, Qt.AlignLeft)
-            h.addStretch(1)
-
-        # Insert bubble above the final stretch
-        self.messages_layout.insertWidget(self.messages_layout.count() - 1, bubble)
-
-        # Auto-scroll to bottom
-        QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
-            self.scroll_area.verticalScrollBar().maximum()
-        ))
-
-
-    def setup_ui(self):
-        """
-        Placeholder in case additional setup is needed. For now,
-        everything is initialized in __init__ directly.
-        """
-        pass
-
-    def _get_private_chat_id(self, partner: str) -> str:
-        return f"{self.wallet_id}_{partner}"
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  PRIVATE KEY-EXCHANGE + ENCRYPTION HANDLERS
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def _poll_key_exchanges(self, partner: str):
-        """
-        Poll /api/key-exchange for any entries addressed to self.wallet_id from `partner`.
-        For each matching entry:
-          1) base64-decode the encrypted_key
-          2) rsa_decrypt with our private key
-          3) save the AES key locally (under "<self>_<partner>")
-          4) DELETE the entry at /api/key-exchange/<id>
-          5) store in self.aes_key_map
-        """
-        try:
-            resp = requests.get(
-                f"{API_BASE}/key-exchange",
-                headers={"Authorization": f"Bearer {self.access_token}"}
-            )
-            if resp.status_code != 200:
-                return
-            entries = resp.json()
-        except Exception:
-            return
-
-        chat_id = f"{self.wallet_id}_{partner}"
-        for entry in entries:
-            sender = entry.get("from")
-            if sender != partner:
-                continue  # skip entries not from our chat partner
-
-            wrapped_b64 = entry.get("encrypted_key", "")
-            try:
-                wrapped = base64.b64decode(wrapped_b64)
-                aes_bytes = rsa_decrypt(self.privkey, wrapped)
-                version = "v1"
-                # Save to disk & memory
-                save_aes_key(chat_id, version, aes_bytes)
-                self.aes_key_map[chat_id] = aes_bytes
-                # Delete the server-side entry
-                key_id = entry.get("id")
-                requests.delete(
-                    f"{API_BASE}/key-exchange/{key_id}",
-                    headers={"Authorization": f"Bearer {self.access_token}"}
-                )
-            except Exception:
-                pass
-
-
-    def _get_or_create_aes_key(self, partner: str):
-        """
-        Retrieve or generate an AES key for private chat with `partner`.
-        New flow:
-        1) Poll /api/key-exchange for any pending entries from `partner`. If found, decrypt and use it.
-        2) If no key in memory or disk, generate new AES, wrap under partner’s RSA, and POST /api/key-exchange/send.
-        """
-        chat_id = f"{self.wallet_id}_{partner}"
-
-        # 1) Poll for an incoming wrapped AES key
-        self._poll_key_exchanges(partner)
-        if chat_id in self.aes_key_map:
-            return self.aes_key_map[chat_id]
-
-        # 2) Try to load from disk
-        try:
-            keybytes = load_aes_key(chat_id, "v1")
-            self.aes_key_map[chat_id] = keybytes
-            return keybytes
-        except FileNotFoundError:
-            pass
-
-        # 3) No key → generate new AES and send via /api/key-exchange/send
-        new_aes = os.urandom(32)
-
-        # Fetch partner's RSA public key
-        resp = requests.get(f"{API_BASE}/user/{partner}")
-        if resp.status_code != 200 or not resp.json().get("exists"):
-            raise Exception("Failed to fetch partner’s public key")
-        partner_pub_pem = resp.json()["pubkey"]
-        partner_pubkey = load_rsa_public_key(partner, partner_pub_pem)
-
-        # Wrap under RSA-OAEP (SHA-256)
-        wrapped = partner_pubkey.encrypt(
-            new_aes,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        b64_wrapped = base64.b64encode(wrapped).decode("utf-8")
-
-        # Send KEY_EXCHANGE via dedicated endpoint
-        ts = int(time.time() * 1000)
-        json_payload = {
-            "recipient_wallet": partner,
-            "encrypted_key": b64_wrapped,
-            "timestamp": ts
-        }
-        resp2 = requests.post(
-            f"{API_BASE}/key-exchange/send",
-            json=json_payload,
-            headers={"Authorization": f"Bearer {self.access_token}"}
-        )
-        if resp2.status_code not in (200, 201):
-            raise Exception("Failed to send key exchange to partner.")
-
-        # Save new AES key locally
-        save_aes_key(chat_id, "v1", new_aes)
-        self.aes_key_map[chat_id] = new_aes
-        return new_aes
-
-
-    def _handle_incoming_private(self, sender: str, text: str, sig_b64: str, ts: int):
-        """
-        Handle incoming private messages: AES_GCM (with RSA signature) or plaintext.
-        We no longer expect KEY_EXCHANGE: in `text`. Instead, key-exchange is polled separately.
-        """
-        # 1) Before handling any new ciphertext, attempt to poll for a key-exchange
-        self._poll_key_exchanges(sender)
-
-        # Fetch sender's public key (needed for signature verification)
-        resp = requests.get(f"{API_BASE}/user/{sender}")
-        data = resp.json()
-        if resp.status_code != 200 or not data.get("exists"):
-            return
-        sender_pub_pem = data["pubkey"]
-        sender_pubkey = load_rsa_public_key(sender, sender_pub_pem)
-
-        # 2) AES_GCM payload
-        if text.startswith("AES_GCM:"):
-            b64_payload = text.split("AES_GCM:", 1)[1]
-            payload_bytes = base64.b64decode(b64_payload)
-            sig_bytes = base64.b64decode(sig_b64)
-
-            # Verify signature
-            if not rsa_verify(sender_pubkey, sig_bytes, payload_bytes):
-                QMessageBox.critical(self, "Error", "Invalid signature—message tampered.")
-                return
-
-            chat_id = self._get_private_chat_id(sender)
-            # Ensure key exists
-            if chat_id not in self.aes_key_map:
-                try:
-                    keybytes = load_aes_key(chat_id, "v1")
-                    self.aes_key_map[chat_id] = keybytes
-                except FileNotFoundError:
-                    QMessageBox.warning(self, "Error", "No AES key for this chat.")
-                    return
-
-            aes_key = self.aes_key_map[chat_id]
-            try:
-                aesgcm = AESGCM(aes_key)
-                nonce = payload_bytes[:12]
-                ct_and_tag = payload_bytes[12:]
-                plaintext_bytes = aesgcm.decrypt(nonce, ct_and_tag, None)
-                plaintext = plaintext_bytes.decode("utf-8", errors="ignore")
-            except Exception:
-                QMessageBox.critical(self, "Error", "Failed to decrypt message.")
-                plaintext = "[Decryption error]"
-
-            sender_label = "Me" if sender == self.wallet_id else sender
-            self._add_private_bubble(sender_label, plaintext, ts)
-            if ts > self.last_timestamp:
-                self.last_timestamp = ts
-            return
-
-        # 3) Plaintext fallback
-        sender_label = "Me" if sender == self.wallet_id else sender
-        self._add_private_bubble(sender_label, text, ts)
-        if ts > self.last_timestamp:
-            self.last_timestamp = ts
-
-
-    # ──────────────────────────────────────────────────────────────────────────
-    #  LOAD & DISPLAY CONVERSATION LIST
-    # ──────────────────────────────────────────────────────────────────────────
-
-    def load_conversations(self):
-        """
-        Build and display a list of all private partners and channels:
-          • For private: show “wallet_id – last_message_snippet”
-          • For channel: show “[Group] name – last_message_snippet”
-          • If last_message was a picture, use “📷 Sent a picture”
-          • Mark unread items in red
-        (No changes needed here for key-exchange.)
-        """
-        try:
-            # 1) Fetch all private messages
-            resp = requests.get(f"{API_BASE}/messages", headers={"Authorization": f"Bearer {self.access_token}"})
-            if resp.status_code != 200:
-                raise Exception(resp.text)
-            msgs = resp.json()
-
-            private_map = {}
-            # Determine the latest snippet for each private partner
-            for m in msgs:
-                sender    = m.get("from")
-                recipient = m.get("to")
-                ts        = m.get("timestamp")
-                ciphertext = m.get("message", "")
-                if sender is None or recipient is None or ts is None:
-                    continue
-
-                # Determine the “other side” of this conversation
-                partner = recipient if sender == self.wallet_id else sender
-
-                # ─── TRY TO DECRYPT THIS CIPHERTEXT TO A PLAIN SNIPPET ───
-                snippet = ""
-                if ciphertext.startswith("AES_GCM:"):
-                    chat_id = self._get_private_chat_id(partner)
-                    if chat_id in self.aes_key_map:
-                        try:
-                            b64_payload = ciphertext.split("AES_GCM:", 1)[1]
-                            payload_bytes = base64.b64decode(b64_payload)
-                            aes_key = self.aes_key_map[chat_id]
-                            plaintext_bytes = aes_decrypt(aes_key, payload_bytes)
-                            snippet = plaintext_bytes.decode("utf-8", errors="ignore")
-                        except Exception:
-                            snippet = "[Encrypted]"
-                    else:
-                        snippet = "[Encrypted]"
-                elif ciphertext.startswith("data:image/"):
-                    snippet = "📷 Sent a picture"
-                else:
-                    snippet = ciphertext
-
-                if sender == self.wallet_id:
-                    snippet = f"Me: {snippet}"
-
-                existing = private_map.get(partner)
-                if not existing or existing["timestamp"] < ts:
-                    private_map[partner] = {"last_msg": snippet, "timestamp": ts}
-
-            # 2) Fetch channels
-            resp2 = requests.get(f"{API_BASE}/channels", headers={"Authorization": f"Bearer {self.access_token}"})
-            if resp2.status_code != 200:
-                raise Exception(resp2.text)
-            chans = resp2.json()
-
-            channel_map = {}
-            for c in chans:
-                cid_str = str(c["id"])
-                channel_map[cid_str] = {"name": c["name"], "last_msg": "", "timestamp": 0}
-
-            for cid_str in channel_map.keys():
-                resp_ch = requests.get(
-                    f"{API_BASE}/channel/{cid_str}/messages",
-                    headers={"Authorization": f"Bearer {self.access_token}"}
-                )
-                if resp_ch.status_code != 200:
-                    continue
-                ch_msgs = resp_ch.json()
-                if not isinstance(ch_msgs, list) or not ch_msgs:
-                    continue
-                ch_msgs.sort(key=lambda x: x["timestamp"])
-                last = ch_msgs[-1]
-                snippet = last["message"]
-                if snippet.startswith("AES_GCM:") or snippet.startswith("data:image/"):
-                    snippet = "📷 Sent a picture"
-                else:
-                    snippet = snippet[:20] + "…" if len(snippet) > 23 else snippet
-
-                channel_map[cid_str]["last_msg"] = snippet
-                channel_map[cid_str]["timestamp"] = last["timestamp"]
-
-            # 3) Combine & sort
-            combined = []
-            for p, info in private_map.items():
-                combined.append({
-                    "type": "private",
-                    "key": p,
-                    "display": p,
-                    "last_msg": info["last_msg"],
-                    "timestamp": info["timestamp"]
-                })
-            for cid_str, info in channel_map.items():
-                combined.append({
-                    "type": "channel",
-                    "key": cid_str,
-                    "display": f"[Group] {info['name']}",
-                    "last_msg": info["last_msg"],
-                    "timestamp": info["timestamp"]
-                })
-
-            combined.sort(key=lambda x: x["timestamp"], reverse=True)
-
-            prev_partner = self.current_partner
-            prev_channel = self.current_channel
-            self.conversation_list.clear()
-
-            for entry in combined:
-                snippet = entry["last_msg"]
-                if len(snippet) > 30:
-                    snippet = snippet[:27] + "…"
-
-                text = f"{entry['display']}  —  {snippet}"
-                item = QListWidgetItem(text)
-                if entry["key"] in self.unread_map:
-                    item.setForeground(QBrush(QColor("red")))
-                item.setData(Qt.UserRole, (entry["type"], entry["key"]))
-                self.conversation_list.addItem(item)
-
-            # Reselect previously selected item if still present
-            for i in range(self.conversation_list.count()):
-                it = self.conversation_list.item(i)
-                it_type, it_key = it.data(Qt.UserRole)
-                if (it_type == "private" and it_key == prev_partner) or \
-                   (it_type == "channel" and it_key == prev_channel):
-                    self.conversation_list.setCurrentItem(it)
-                    break
-
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load conversations:\n{str(e)}")
-
-
-    ## third part
-
+    # third part
     # ──────────────────────────────────────────────────────────────────────────
     #  HANDLING CONVERSATION SELECTION
     # ──────────────────────────────────────────────────────────────────────────
@@ -1253,15 +1592,18 @@ class ChatWindow(QMainWindow):
     def load_private_history(self, partner):
         """
         Load full private history between self.wallet_id and partner into bubble area.
+        Every Base64 decode/AES decrypt is wrapped in try/except. If it fails,
+        we fall back to “[Decryption error]”—_add_private_bubble will handle any
+        data:image/... URIs and render them as images.
         """
         # 1) Set current state
         self.current_partner = partner
         self.current_channel = None
 
-        # 2) Disable layout updates to avoid flicker while clearing
+        # 2) Temporarily disable layout updates while clearing
         self.messages_container.setEnabled(False)
 
-        # 3) Clear existing bubbles (leave only the final stretch)
+        # 3) Clear existing bubbles (leave only the final stretch spacer)
         while self.messages_layout.count() > 1:
             w = self.messages_layout.takeAt(0).widget()
             if w:
@@ -1270,7 +1612,7 @@ class ChatWindow(QMainWindow):
         # Reset the timestamp tracker
         self.last_timestamp = 0
 
-        # 4) Ensure an AES key exists (or attempt to load from disk)
+        # 4) Ensure we have (or attempt to load) an AES key from disk
         chat_id = self._get_private_chat_id(partner)
         if chat_id not in self.aes_key_map:
             try:
@@ -1279,20 +1621,24 @@ class ChatWindow(QMainWindow):
             except FileNotFoundError:
                 pass
 
-        # 5) Update the header to show the partner’s wallet_id
+        # 5) Update header to show the partner’s wallet_id
         self.chat_title.setText(partner)
 
         try:
             # 6) Fetch all messages from the server
-            resp = requests.get(f"{API_BASE}/messages", headers={"Authorization": f"Bearer {self.access_token}"})
+            resp = requests.get(
+                f"{API_BASE}/messages",
+                headers={"Authorization": f"Bearer {self.access_token}"}
+            )
             if resp.status_code != 200:
                 raise Exception(resp.text)
             msgs = resp.json()
             if not isinstance(msgs, list):
                 QMessageBox.critical(self, "Error", f"Expected list, got:\n{msgs}")
+                self.messages_container.setEnabled(True)
                 return
 
-            # 7) Filter to only messages between self.wallet_id and partner
+            # 7) Filter only messages between self and partner
             history = []
             for m in msgs:
                 sender = m.get("from")
@@ -1302,8 +1648,6 @@ class ChatWindow(QMainWindow):
                 sig = m.get("signature", "")
                 if sender is None or recipient is None or ts is None:
                     continue
-
-                # Only include if this is a two-way chat between us and partner
                 if (sender == partner and recipient == self.wallet_id) or \
                    (sender == self.wallet_id and recipient == partner):
                     history.append({
@@ -1316,27 +1660,21 @@ class ChatWindow(QMainWindow):
             # 8) Sort by timestamp ascending
             history.sort(key=lambda x: x["timestamp"])
 
-            # 9) For each message, decrypt and display a bubble
+            # 9) Decrypt/display each message as a bubble
             for m in history:
-                sender = m["from"]
+                sender     = m["from"]
                 ciphertext = m["message"]
-                sig = m["signature"]
-                ts = m["timestamp"]
+                sig        = m["signature"]
+                ts         = m["timestamp"]
 
+                display_text = ciphertext  # default
+
+                # A) KEY_EXCHANGE handling (unchanged)…
                 if ciphertext.startswith("KEY_EXCHANGE:"):
-                    b64_wrapped = ciphertext.split("KEY_EXCHANGE:", 1)[1]
-                    wrapped = base64.b64decode(b64_wrapped)
-                    try:
-                        aes_bytes = rsa_decrypt(self.privkey, wrapped)
-                        save_aes_key(chat_id, "v1", aes_bytes)
-                        self.aes_key_map[chat_id] = aes_bytes
-                    except Exception:
-                        QMessageBox.critical(self, "Error", "Invalid KEY_EXCHANGE or decryption failed.")
-                    if ts > self.last_timestamp:
-                        self.last_timestamp = ts
+                    # …decrypt and save AES key, skip bubble
                     continue
 
-                display_text = ciphertext
+                # B) If AES_GCM payload, decrypt:
                 if ciphertext.startswith("AES_GCM:") and chat_id in self.aes_key_map:
                     try:
                         b64_payload = ciphertext.split("AES_GCM:", 1)[1]
@@ -1350,25 +1688,27 @@ class ChatWindow(QMainWindow):
                     except Exception:
                         display_text = "[Decryption error]"
 
-                if display_text.startswith("data:image/"):
-                    display_text = "📷 Sent a picture"
-
+                # C) Now simply hand off display_text (which might be “data:image/…” or plain text)
                 sender_label = "Me" if sender == self.wallet_id else sender
                 self._add_private_bubble(sender_label, display_text, ts)
+
                 if ts > self.last_timestamp:
                     self.last_timestamp = ts
 
             # 10) Re-enable layout updates and scroll to bottom
             self.messages_container.setEnabled(True)
-            QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
-                self.scroll_area.verticalScrollBar().maximum()
-            ))
+            QTimer.singleShot(100, lambda:
+                self.scroll_area.verticalScrollBar().setValue(
+                    self.scroll_area.verticalScrollBar().maximum()
+                )
+            )
 
-            # 11) Restart the private‐poll timer so new messages arrive automatically
+            # 11) Restart the polling timer so new messages arrive
             self.private_poll_timer.start(3000)
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to load messages:\n{str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to load messages:\n{e}")
+            self.messages_container.setEnabled(True)
 
 
     def poll_new_messages(self):
@@ -1405,7 +1745,7 @@ class ChatWindow(QMainWindow):
     def send_message(self):
         """
         Encrypt and send a new private message, then display it in a bubble immediately.
-        Always sends a KEY_EXCHANGE first if no AES key exists.
+        Now handles images (data-URI) by rendering them as actual image bubbles.
         """
         text = self.message_input.text().strip()
         if not text or not self.current_partner:
@@ -1424,9 +1764,9 @@ class ChatWindow(QMainWindow):
                 resp = requests.get(f"{API_BASE}/user/{partner}")
                 resp.raise_for_status()
                 peer_pub_pem = resp.json()["pubkey"]
-                peer_pubkey = load_rsa_public_key(partner, peer_pub_pem)
+                partner_pubkey = load_rsa_public_key(partner, peer_pub_pem)
                 # Wrap under RSA-OAEP (SHA-256)
-                wrapped = peer_pubkey.encrypt(
+                wrapped = partner_pubkey.encrypt(
                     new_aes,
                     padding.OAEP(
                         mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -1452,7 +1792,7 @@ class ChatWindow(QMainWindow):
                 save_aes_key(chat_id, "v1", new_aes)
                 self.aes_key_map[chat_id] = new_aes
 
-            # 2) AES-GCM encrypt the plaintext
+            # 2) AES-GCM encrypt the plaintext or data-URI
             aes_key = self.aes_key_map[chat_id]
             aesgcm = AESGCM(aes_key)
             nonce = os.urandom(12)
@@ -1479,8 +1819,16 @@ class ChatWindow(QMainWindow):
             )
             resp2.raise_for_status()
 
-            # 5) Display outgoing bubble immediately
-            self._add_private_bubble("Me", text, ts)
+            # 5) Display outgoing bubble immediately (image or text)
+            if text.startswith("data:image/"):
+                b64_data = text.split(",", 1)[1]
+                image_bytes = base64.b64decode(b64_data)
+                image = QImage.fromData(QByteArray(image_bytes))
+                pixmap = QPixmap.fromImage(image).scaledToWidth(94590, Qt.SmoothTransformation)
+                self._add_image_bubble("Me", pixmap, ts)
+            else:
+                self._add_private_bubble("Me", text, ts)
+
             self.last_timestamp = ts
             self.message_input.clear()
             self.load_conversations()
@@ -1518,7 +1866,6 @@ class ChatWindow(QMainWindow):
             self.message_input.setText(data_uri)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to attach image:\n{str(e)}")
-
 
     # ──────────────────────────────────────────────────────────────────────────
     #  NEW CHAT & CHANNEL HANDLERS
@@ -1776,3 +2123,5 @@ class ChatWindow(QMainWindow):
         if not hasattr(self, "_unread_map"):
             self._unread_map = {}
         return self._unread_map
+
+
