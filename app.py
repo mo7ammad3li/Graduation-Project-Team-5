@@ -1,5 +1,3 @@
-# app.py
-
 import threading
 import time
 import json
@@ -9,13 +7,10 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_migrate import Migrate
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity,
     get_jwt, verify_jwt_in_request
 )
-from flask_jwt_extended.exceptions import JWTExtendedException
 from flask_cors import CORS
 from flask_socketio import SocketIO, emit, join_room
 from sqlalchemy import or_
@@ -41,12 +36,6 @@ db      = SQLAlchemy(app)
 bcrypt  = Bcrypt(app)
 jwt     = JWTManager(app)
 migrate = Migrate(app, db)
-
-limiter = Limiter(
-    key_func=get_remote_address,
-    default_limits=["1000 per day", "500 per hour"]
-)
-limiter.init_app(app)
 
 # Flask-SocketIO
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -74,6 +63,10 @@ RPC_URL      = "http://127.0.0.1:38083/json_rpc"
 RPC_USER     = "mo"
 RPC_PASSWORD = "m1@t2@m3@"
 HEADERS      = {"Content-Type": "application/json"}
+
+# ─── Track Pending Payment Monitors ────────────────────────────────────────────
+
+monitoring_users = set()
 
 # ─── Database Models ────────────────────────────────────────────────────────────
 
@@ -163,46 +156,89 @@ def monitor_payment(user_id, months=1):
     Poll Monero daemon for incoming transfer to user.subaddress.
     Once payment ≥ 0.00001 XMR is detected, mark user as verified and extend subscription.
     """
-    with app.app_context():
-        user = User.query.get(user_id)
+    try:
+        user = None
         while True:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": "0",
-                "method": "get_transfers",
-                "params": {
-                    "in": True,
-                    "account_index": 0,
-                    "subaddr_indices": [user.subaddress_index]
+            with app.app_context():
+                user = User.query.get(user_id)
+                if not user:
+                    break
+
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": "0",
+                    "method": "get_transfers",
+                    "params": {
+                        "in": True,
+                        "account_index": 0,
+                        "subaddr_indices": [user.subaddress_index]
+                    }
                 }
-            }
-            resp = requests.post(
-                RPC_URL,
-                headers=HEADERS,
-                data=json.dumps(payload),
-                auth=HTTPDigestAuth(RPC_USER, RPC_PASSWORD)
-            )
-            if resp.status_code == 200:
-                for tx in resp.json().get("result", {}).get("in", []):
-                    amount = float(tx["amount"]) / 1e12
-                    if tx["address"] == user.subaddress and amount >= 0.00001:
-                        user.verified = True
-                        # Extend subscription by requested number of months
-                        now = datetime.utcnow()
-                        if user.subscription_expires and user.subscription_expires > now:
-                            user.subscription_expires += timedelta(days=30 * months)
-                        else:
-                            user.subscription_expires = now + timedelta(days=30 * months)
-                        db.session.commit()
-                        return
+                resp = requests.post(
+                    RPC_URL,
+                    headers=HEADERS,
+                    data=json.dumps(payload),
+                    auth=HTTPDigestAuth(RPC_USER, RPC_PASSWORD)
+                )
+                if resp.status_code == 200:
+                    for tx in resp.json().get("result", {}).get("in", []):
+                        amount = float(tx["amount"]) / 1e12
+                        if tx["address"] == user.subaddress and amount >= 0.00001 * months:
+                            user.verified = True
+                            now = datetime.utcnow()
+                            if user.subscription_expires and user.subscription_expires > now:
+                                user.subscription_expires += timedelta(days=30 * months)
+                            else:
+                                user.subscription_expires = now + timedelta(days=30 * months)
+                            db.session.commit()
+                            return
             time.sleep(10)
+    finally:
+        # Remove from monitoring set when done or on error
+        monitoring_users.discard(user_id)
+
+# ─── Subscription Status Endpoint ───────────────────────────────────────────────
+
+@app.route("/api/subscription/status", methods=["GET"])
+def subscription_status():
+    """
+    Public endpoint: check if a user's payment has been confirmed.
+    Client should call GET /api/subscription/status?wallet_id=<wallet_id>.
+    Returns: {"verified": True/False}
+    """
+    wallet_id = request.args.get("wallet_id")
+    if not wallet_id:
+        return jsonify({"error": "Missing wallet_id"}), 400
+
+    user = User.query.filter_by(wallet_id=wallet_id).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify({"verified": user.verified}), 200
+
+# ─── Subscription Renewal Status Endpoint ───────────────────────────────────────
+
+@app.route("/api/subscription/status/<wallet_id>", methods=["GET"])
+@jwt_required()
+def subscription_status_with_token(wallet_id):
+    """
+    Authenticated endpoint to fetch subscription expiry date and verified status.
+    Returns: {"end_date": "YYYY-MM-DDTHH:MM:SS", "verified": True/False}
+    """
+    user = User.query.filter_by(wallet_id=wallet_id).first()
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    return jsonify({
+        "end_date": user.subscription_expires.isoformat() if user.subscription_expires else None,
+        "verified": user.verified
+    }), 200
 
 # ─── Subscription Enforcement ───────────────────────────────────────────────────
 
 @app.before_request
 def enforce_subscription():
     path = request.path
-    # Only enforce on /api/* except register, login, logout, user, change_password, and subscription endpoints
     exempt = {
         "/api/register",
         "/api/login",
@@ -210,9 +246,9 @@ def enforce_subscription():
         "/api/user/",
         "/api/change_password",
         "/api/subscription/renew",
-        "/api/update_pubkey"   # allow public key updates without subscription check
+        "/api/subscription/status",      # allow checking status without token
+        "/api/update_pubkey"            # allow public key updates without subscription check
     }
-    # If path startswith "/api/" and is not one of the exempt endpoints
     if path.startswith("/api/") and not any(path.startswith(ex) for ex in exempt):
         try:
             verify_jwt_in_request()
@@ -222,7 +258,7 @@ def enforce_subscription():
                 return jsonify({"error": "Invalid user"}), 401
             if user.subscription_expires and user.subscription_expires < datetime.utcnow():
                 return jsonify({"error": "Subscription expired"}), 403
-        except JWTExtendedException as e:
+        except Exception as e:
             return jsonify({"error": str(e)}), 401
 
 # ─── Socket.IO Handlers ─────────────────────────────────────────────────────────
@@ -259,9 +295,9 @@ def api_register():
     wallet_id  = data.get("wallet_id")
     password   = data.get("password")
     pubkey     = data.get("pubkey")
-    months     = data.get("months")    # 1) grab months
+    months     = data.get("months")
 
-    # 2) Validate all inputs
+    # Validate inputs
     if not wallet_id or not password or not pubkey:
         return jsonify({"error": "Missing wallet_id, password, or pubkey"}), 400
     if not isinstance(months, int) or months <= 0:
@@ -269,7 +305,7 @@ def api_register():
     if User.query.filter_by(wallet_id=wallet_id).first():
         return jsonify({"error": "Wallet already registered"}), 400
 
-    # 3) Create a new Monero subaddress for payment
+    # Create a new Monero subaddress for payment
     rpc = {
         "jsonrpc": "2.0",
         "id": "0",
@@ -285,7 +321,7 @@ def api_register():
 
     res = r.json()["result"]
 
-    # 4) Hash password & create User
+    # Hash password & create User
     hashed_pw = bcrypt.generate_password_hash(password).decode()
     user = User(
         wallet_id=wallet_id,
@@ -297,10 +333,11 @@ def api_register():
     db.session.add(user)
     db.session.commit()
 
-    # 5) Start the payment monitor with the requested months
-    threading.Thread(target=monitor_payment, args=(user.id, months), daemon=True).start()
+    # Start the payment monitor if not already monitoring
+    if user.id not in monitoring_users:
+        monitoring_users.add(user.id)
+        threading.Thread(target=monitor_payment, args=(user.id, months), daemon=True).start()
 
-    # 6) Tell the client how much to send
     amount_required = 0.00001 * months
     return jsonify({
         "message": f"User registered. Send {amount_required:.8f} XMR to subaddress.",
@@ -308,9 +345,7 @@ def api_register():
         "amount_required": amount_required
     }), 201
 
-
 @app.route("/api/login", methods=["POST"])
-@limiter.limit("10 per minute")
 def api_login():
     data = request.get_json() or {}
     wallet_id = data.get("wallet_id")
@@ -390,7 +425,6 @@ def get_user_by_id(wallet_id):
 @app.route("/api/block-list", methods=["GET"])
 @jwt_required()
 @token_not_revoked
-@limiter.exempt
 def get_block_list():
     me = get_jwt_identity()
     blocked_entries = BlockedUser.query.filter_by(blocker_wallet_id=me).all()
@@ -488,11 +522,8 @@ def send_message():
 
 @app.route("/api/messages", methods=["GET"])
 @jwt_required()
-@token_not_revoked
-@limiter.exempt
 def get_messages():
     me = get_jwt_identity()
-    # Return any messages where recipient == me or sender == me.
     msgs = Message.query.filter(
         or_(
             Message.recipient_wallet == me,
@@ -548,8 +579,6 @@ def create_channel():
 
 @app.route("/api/channels", methods=["GET"])
 @jwt_required()
-@token_not_revoked
-@limiter.exempt
 def list_channels():
     me  = get_jwt_identity()
     now = datetime.utcnow()
@@ -606,7 +635,7 @@ def send_channel_message(channel_id):
     data = request.get_json() or {}
     msg_text = data.get("message")
     sig      = data.get("signature")
-    ts = data.get("timestamp")
+    ts       = data.get("timestamp")
     if not msg_text or ts is None or sig is None:
         return jsonify({"error": "Missing fields"}), 400
 
@@ -632,8 +661,6 @@ def send_channel_message(channel_id):
 
 @app.route("/api/channel/<int:channel_id>/messages", methods=["GET"])
 @jwt_required()
-@token_not_revoked
-@limiter.exempt
 def get_channel_messages(channel_id):
     ch = Channel.query.get_or_404(channel_id)
     user = get_jwt_identity()
@@ -666,7 +693,7 @@ def send_key_exchange():
     Client must send:
       {
         "recipient_wallet": "<other_user_wallet_id>",
-        "encrypted_key": "<base64-or‐PEM-string‐of‐AES‐key‐encrypted‐with‐recipient‐RSA>"
+        "encrypted_key": "<base64-or‐PEM-string‐of‐AES‐key‐encrypted‐with‐recipient‐RSA>",
         "timestamp": <unix_timestamp_integer>
       }
     """
@@ -705,18 +732,29 @@ def send_key_exchange():
 
 @app.route("/api/key-exchange", methods=["GET"])
 @jwt_required()
-@token_not_revoked
 def get_key_exchanges():
     """
     Returns all pending KeyExchange rows where recipient_wallet == current user.
-    Once the frontend consumes them, you might want to delete them.
     """
     me = get_jwt_identity()
     entries = KeyExchange.query.filter_by(recipient_wallet=me).order_by(KeyExchange.timestamp).all()
     result = [ ke.to_dict() for ke in entries ]
-
     return jsonify(result), 200
 
+@app.route("/api/key-exchange/<int:key_id>", methods=["DELETE"])
+@jwt_required()
+def delete_key_exchange(key_id):
+    """
+    Delete a KeyExchange entry (either private or channel).
+    """
+    ke = KeyExchange.query.get_or_404(key_id)
+    me = get_jwt_identity()
+    # Only sender or recipient may delete their own key-exchange entry
+    if me not in (ke.sender_wallet, ke.recipient_wallet):
+        return jsonify({"error": "Not authorized"}), 403
+    db.session.delete(ke)
+    db.session.commit()
+    return jsonify({"message": "Key exchange entry deleted"}), 200
 
 @app.route("/api/subscription/renew", methods=["POST"])
 def renew_subscription():
@@ -759,7 +797,11 @@ def renew_subscription():
     user.verified = False
     db.session.commit()
 
-    # Start a new monitor thread for this user, passing the requested months
+    # If a monitor is already running, return an error
+    if user.id in monitoring_users:
+        return jsonify({"error": "Payment monitor already running"}), 400
+
+    monitoring_users.add(user.id)
     threading.Thread(target=monitor_payment, args=(user.id, months), daemon=True).start()
 
     return jsonify({"subaddress": user.subaddress}), 200
