@@ -1,10 +1,9 @@
-# login_window.py
-
 import os
 import requests
 import webbrowser
-from datetime import datetime, timedelta
 from pathlib import Path
+from datetime import datetime
+
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QGuiApplication
 from PyQt5.QtWidgets import (
@@ -30,8 +29,6 @@ from cryptography.hazmat.primitives import serialization
 from crypto_helper import (
     KEY_DIR,
     load_rsa_private_key,
-    get_last_rsa_rotation,
-    update_last_rsa_rotation,
 )
 
 API_BASE = "http://127.0.0.1:5000/api"
@@ -258,45 +255,14 @@ class LoginWindow(QMainWindow):
                 self.show_error("No access token received.")
                 return
 
-            # RSA key rotation check
-            last_rot = get_last_rsa_rotation()
-            now = datetime.utcnow()
-            if (not last_rot) or ((now - last_rot) > timedelta(hours=24)):
-                # Generate new 2048-bit RSA keypair
-                new_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-                priv_pem = new_priv.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
-                )
-                priv_path = KEY_DIR / f"{w}_private_key.pem"
-                with open(priv_path, "wb") as f:
-                    f.write(priv_pem)
+            # Attempt to load existing private key
+            try:
+                self.privkey = load_rsa_private_key(w)
+            except Exception:
+                self.show_error("Could not load your private key. It may be missing or corrupted.")
+                return
 
-                pub_pem = new_priv.public_key().public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                ).decode("utf-8")
-
-                headers = {"Authorization": f"Bearer {token}"}
-                resp_upd = requests.post(
-                    f"{API_BASE}/update_pubkey",
-                    json={"pubkey": pub_pem},
-                    headers=headers
-                )
-                if resp_upd.status_code != 200:
-                    self.show_error("Failed to update public key on server.")
-                    return
-
-                update_last_rsa_rotation()
-                self.privkey = new_priv
-            else:
-                try:
-                    self.privkey = load_rsa_private_key(w)
-                except Exception:
-                    self.show_error("Could not load your private key. It may be missing or corrupted.")
-                    return
-
+            # Emit login_success with token and wallet_id
             self.login_success.emit(token, w)
 
         except Exception as e:
@@ -415,44 +381,12 @@ class LoginWindow(QMainWindow):
                 self.show_error("Auto-login: no token received.")
                 return
 
-            # RSA key rotation on auto-login as well
-            last_rot = get_last_rsa_rotation()
-            now = datetime.utcnow()
-            if (not last_rot) or ((now - last_rot) > timedelta(hours=24)):
-                # Generate new RSA keypair
-                new_priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-                priv_pem = new_priv.private_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PrivateFormat.PKCS8,
-                    encryption_algorithm=serialization.NoEncryption()
-                )
-                priv_path = KEY_DIR / f"{w}_private_key.pem"
-                with open(priv_path, "wb") as f:
-                    f.write(priv_pem)
-
-                pub_pem = new_priv.public_key().public_bytes(
-                    encoding=serialization.Encoding.PEM,
-                    format=serialization.PublicFormat.SubjectPublicKeyInfo
-                ).decode("utf-8")
-
-                headers = {"Authorization": f"Bearer {token}"}
-                resp_upd = requests.post(
-                    f"{API_BASE}/update_pubkey",
-                    json={"pubkey": pub_pem},
-                    headers=headers
-                )
-                if resp_upd.status_code != 200:
-                    self.show_error("Failed to update public key on server.")
-                    return
-
-                update_last_rsa_rotation()
-                self.privkey = new_priv
-            else:
-                try:
-                    self.privkey = load_rsa_private_key(w)
-                except Exception:
-                    self.show_error("Could not load your private key. It may be missing or corrupted.")
-                    return
+            # Attempt to load existing private key
+            try:
+                self.privkey = load_rsa_private_key(w)
+            except Exception:
+                self.show_error("Could not load your private key. It may be missing or corrupted.")
+                return
 
             # Emit login_success with token and wallet_id
             self.login_success.emit(token, w)
