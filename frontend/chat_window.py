@@ -149,10 +149,10 @@ class ChannelMessageDialog(QDialog):
         h.addWidget(self.msg_input, stretch=1)
 
         # Attach button
-        self.btn_attach = QPushButton()
+        self.btn_attach = QPushButton("1")
         self.btn_attach.setIcon(QIcon(":/icons/attach.png"))
         self.btn_attach.setIconSize(QSize(20, 20))
-        self.btn_attach.setFixedSize(36, 36)
+        self.btn_attach.setFixedSize(44, 44)
         self.btn_attach.setStyleSheet("""
             QPushButton {
                 border: none;
@@ -165,10 +165,10 @@ class ChannelMessageDialog(QDialog):
         h.addWidget(self.btn_attach)
 
         # Send button
-        self.btn_send = QPushButton()
+        self.btn_send = QPushButton("Send")
         self.btn_send.setIcon(QIcon(":/icons/send.png"))
         self.btn_send.setIconSize(QSize(20, 20))
-        self.btn_send.setFixedSize(36, 36)
+        self.btn_send.setFixedSize(44, 44)
         self.btn_send.setStyleSheet("""
             QPushButton {
                 border: none;
@@ -1034,7 +1034,7 @@ class ChatWindow(QMainWindow):
         self.message_input.setFixedHeight(44)
         input_layout.addWidget(self.message_input)
 
-        self.btn_attach = QPushButton()
+        self.btn_attach = QPushButton("2")
         self.btn_attach.setIcon(QIcon(":/icons/attach.png"))
         self.btn_attach.setIconSize(QSize(20, 20))
         self.btn_attach.setFixedSize(44, 44)
@@ -1048,7 +1048,7 @@ class ChatWindow(QMainWindow):
         """)
         input_layout.addWidget(self.btn_attach)
 
-        self.send_button = QPushButton()
+        self.send_button = QPushButton("➤")
         self.send_button.setObjectName("sendButton")
         self.send_button.setIcon(QIcon(":/icons/send.png"))
         self.send_button.setIconSize(QSize(20, 20))
@@ -1056,7 +1056,7 @@ class ChatWindow(QMainWindow):
         self.send_button.setStyleSheet("""
             QPushButton {
                 border: none;
-                background: #0084ff;
+                background: #ff6600;
                 border-radius: 9px;
             }
             QPushButton:hover { background: #0077e6; }
@@ -1504,7 +1504,7 @@ class ChatWindow(QMainWindow):
         self.message_input.returnPressed.connect(self.send_message)
         input_layout.addWidget(self.message_input)
 
-        self.btn_attach = QPushButton()
+        self.btn_attach = QPushButton("🖇️")
         self.btn_attach.setIcon(QIcon(":/icons/attach.png"))
         self.btn_attach.setIconSize(QSize(20, 20))
         self.btn_attach.setFixedSize(44, 44)
@@ -1514,7 +1514,7 @@ class ChatWindow(QMainWindow):
                 background: grey;
                 border-radius: 9px;
             }
-            QPushButton:hover { background: #f0f0f0; }
+            QPushButton:hover { background: #ff6600; }
         """)
         self.btn_attach.clicked.connect(self.attach_image)
         input_layout.addWidget(self.btn_attach)
